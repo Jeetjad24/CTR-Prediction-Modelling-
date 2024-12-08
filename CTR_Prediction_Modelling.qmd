@@ -1,0 +1,197 @@
+
+
+```{r}
+# Loading libraries
+library(dplyr)
+library(xgboost)
+
+#Datasets
+analysis_data <- read.csv('D:/Fall/Predictive/analysis_data.csv')
+scoring_data <- read.csv('D:/Fall/Predictive/scoring_data.csv')
+
+
+analysis_data
+
+```
+
+
+```{r}
+# Missing Values
+prepare_data <- function(data) {
+  #MEAN
+  data <- data %>%
+    mutate(across(where(is.numeric), ~ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+  #MODE
+  get_mode <- function(x) {
+    unique_x <- unique(x)
+    unique_x[which.max(tabulate(match(x, unique_x)))]
+  }
+
+  # Categorical columns with mode
+  data <- data %>%
+    mutate(across(where(is.character), ~ifelse(is.na(.), get_mode(.), .)))
+
+  #Ccategorical variables to factors
+  data <- data %>%
+    mutate(across(c(position_on_page, ad_format, age_group, gender, location, 
+                     time_of_day, day_of_week, device_type), as.factor))
+  
+  return(data)
+}
+
+# Prepare datasets
+analysis_data <- prepare_data(analysis_data)
+scoring_data <- prepare_data(scoring_data)
+```
+
+
+```{r}
+# Matching Scoring Data to Analysis Data
+scoring_data$ad_format <- factor(scoring_data$ad_format, levels = levels(analysis_data$ad_format))
+scoring_data$position_on_page <- factor(scoring_data$position_on_page, levels = levels(analysis_data$position_on_page))
+scoring_data$age_group <- factor(scoring_data$age_group, levels = levels(analysis_data$age_group))
+scoring_data$gender <- factor(scoring_data$gender, levels = levels(analysis_data$gender))
+scoring_data$location <- factor(scoring_data$location, levels = levels(analysis_data$location))
+scoring_data$time_of_day <- factor(scoring_data$time_of_day, levels = levels(analysis_data$time_of_day))
+scoring_data$day_of_week <- factor(scoring_data$day_of_week, levels = levels(analysis_data$day_of_week))
+scoring_data$device_type <- factor(scoring_data$device_type, levels = levels(analysis_data$device_type))
+
+# Dummy Variables
+analysis_data_dummies <- model.matrix(~ . - CTR - 1, data = analysis_data)
+scoring_data_dummies <- model.matrix(~ . - 1, data = scoring_data)
+```
+
+
+```{r}
+# Scoring data to training data columns
+scoring_data_aligned <- scoring_data_dummies[, colnames(scoring_data_dummies) %in% colnames(analysis_data_dummies), drop = FALSE]
+
+# Prepare training data for Model
+X <- analysis_data_dummies
+y <- analysis_data$CTR
+```
+
+
+```{r}
+#MODEL
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  max_depth = 6,
+  eta = 0.1,
+  nthread = 2,
+  subsample = 0.8,               
+  colsample_bytree = 0.8,       
+  gamma = 0                     
+)
+
+#Cross-Validation for parameter tuning
+set.seed(42)  
+cv <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 200,            
+  nfold = 5,               
+  early_stopping_rounds = 10,
+  print_every_n = 10
+)
+
+
+# Extract the best number of rounds
+best_nrounds <- cv$best_iteration
+```
+
+```{r}
+cv_results <- as.data.frame(cv$evaluation_log)
+
+library(ggplot2)
+
+# Plot cross-validation RMSE
+cross_validation_rmse_plot = ggplot(cv_results, aes(x = iter, y = train_rmse_mean)) +
+  geom_line(color = "blue", size = 1) +
+  geom_line(aes(y = test_rmse_mean), color = "red", size = 1) +
+  labs(
+    title = "Cross-Validation RMSE",
+    x = "Number of Rounds",
+    y = "RMSE",
+    caption = "Blue: Train RMSE, Red: Test RMSE"
+  ) +
+  theme_minimal()
+
+ggsave("D:/Fall/Predictive/cross_validation_rmse.png", cross_validation_rmse_plot, width = 8, height = 6)
+
+```
+
+```{r}
+# Train the model 
+xg_model <- xgboost(params = params, data = dtrain, nrounds = best_nrounds)
+
+# Prediction
+train_predictions <- predict(xg_model, dtrain)
+```
+
+```{r}
+library(ggplot2)
+
+# Feature importance
+importance_matrix <- xgb.importance(model = xg_model)
+importance_df <- as.data.frame(importance_matrix)
+
+# Plot feature importance
+feature_importance_plot = ggplot(importance_df, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance", x = "Features", y = "Gain")
+
+
+ggsave("D:/Fall/Predictive/feature_importance.png", feature_importance_plot, width = 8, height = 6)
+```
+
+```{r}
+actual_vs_predicted <- data.frame(Actual = y, Predicted = train_predictions)
+
+actual_vs_predicted_plot = ggplot(actual_vs_predicted, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5, color = "darkgreen") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Actual vs Predicted CTR", x = "Actual CTR", y = "Predicted CTR") +
+  theme_minimal()
+
+ggsave("D:/Fall/Predictive/actual_vs_predicted_ctr.png", actual_vs_predicted_plot, width = 8, height = 6)
+```
+
+
+```{r}
+# RMSE
+rmse <- sqrt(mean((train_predictions - y) ^ 2))
+cat("RMSE on training data:", rmse, "\n")
+
+
+dscoring <- xgb.DMatrix(data = scoring_data_aligned)
+predictions <- predict(xg_model, dscoring)
+```
+```{r}
+predicted_distribution <- data.frame(CTR = predictions)
+
+ctr_distribution_plot = ggplot(predicted_distribution, aes(x = CTR)) +
+  geom_histogram(binwidth = 0.01, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Predicted CTR Distribution", x = "Predicted CTR", y = "Frequency") +
+  theme_minimal()
+
+ggsave("D:/Fall/Predictive/predicted_ctr_distribution.png", ctr_distribution_plot, width = 8, height = 6)
+
+```
+
+
+```{r}
+# Submission file
+submission_file <- data.frame(id = scoring_data$id, CTR = predictions)
+
+
+write.csv(submission_file, 'D:/Fall/Predictive/Test18.csv', row.names = FALSE)
+
+
+```
